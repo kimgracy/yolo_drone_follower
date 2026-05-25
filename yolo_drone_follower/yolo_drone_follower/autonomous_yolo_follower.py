@@ -22,23 +22,23 @@ class AutonomousYoloFollower(Node):
     def __init__(self):
         super().__init__('autonomous_yolo_follower')
 
-        # 1. YOLO 모델 설정
+        # 1. YOLO Model Configuration
         self.model_path = '/home/kimgracy/KIST/ros2_ws/src/yolo_drone_follower/yolo_drone_follower/dead_bird.pt'
         self.model = YOLO(self.model_path)
         self.target_class_name = 'dead-bird'
 
-        # 제어 파라미터 및 임계값 설정
+        # Control Parameters and Thresholds
         self.target_width = 150.0   
         self.kp_x = 0.005           
         self.kp_z = 0.003           
         self.kp_yaw = 0.004         
         
-        self.yolo_hz = 3            # Hz 타임아웃 계산용 기점
-        self.quick_time = 0.5       # 오프보드 트리거를 위한 지속 검출 시간 (초)
-        self.focus_time = 1.5       # 정렬 후 타겟 정밀 정치 검증 시간 (초)
-        self.mc_acceptance_radius = 0.3  # 위치 도달 인정 반경 (m)
-        self.heading_acceptance_angle = 0.05  # 요 회전 허용 오차 (rad)
-        self.align_emergency_threshold = 60   # 회전 타임아웃 (틱 카운트)
+        self.yolo_hz = 3            # Base Hz used for timeout calculation
+        self.quick_time = 0.5       # Required detection duration to trigger offboard (seconds)
+        self.focus_time = 1.5       # Validation time after alignment (seconds)
+        self.mc_acceptance_radius = 0.3  # Position acceptance radius (meters)
+        self.heading_acceptance_angle = 0.05  # Yaw heading error tolerance (radians)
+        self.align_emergency_threshold = 60   # Alignment timeout (tick count)
 
         self.bridge = CvBridge()
         
@@ -54,6 +54,7 @@ class AutonomousYoloFollower(Node):
         self.obstacle_label = ''
         self.obstacle_x = 0.0
         self.image_size = (640, 480)
+        self.current_ratio_percent = 0.0 # Variable to store real-time target ratio within the image frame
         
         self.sys_id = 1
         self.comp_id = 1
@@ -73,6 +74,9 @@ class AutonomousYoloFollower(Node):
         self.goal_position = np.array([0.0, 0.0, 0.0])
         self.goal_yaw = 0.0
 
+        # Approach Control Parameters
+        self.approach_speed = 0.5  # Forward approach speed (m/s)
+
         # QoS Profile
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -81,7 +85,7 @@ class AutonomousYoloFollower(Node):
             depth=1
         )
 
-        # logging setup
+        # Logging Setup
         log_dir = os.path.join(os.getcwd(), 'flight_logs')
         os.makedirs(log_dir, exist_ok=True)
         current_time = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -151,22 +155,21 @@ class AutonomousYoloFollower(Node):
                     
                     ratio_percent = (bbox_width / img_width) * 100.0
                     
-                    # Bouning Box Visualization
+                    # Bounding Box Visualization
                     cv2.rectangle(cv_image, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 255, 0), 2)
                     confidence = float(box.conf[0])
                     label_text = f"{self.target_class_name} {confidence:.2f} ({ratio_percent:.1f}%)"
                     cv2.putText(cv_image, label_text, (int(xmin), max(int(ymin) - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
-                    # Landing Mode
-                    if self.phase == 2 and self.subphase == 'approaching target':
-                        self.cmd_yaw_rate = 0.0
-                        self.cmd_vx = 0.0
-                        self.cmd_vz = 0.0
+                    # Update internal tracking variable for control loops
+                    self.current_ratio_percent = ratio_percent
                     break
             if current_target_found: 
                 break
 
         self.target_detected = current_target_found
+        if not self.target_detected:
+            self.current_ratio_percent = 0.0
         
         # Display Texts
         status_text = f"PHASE {self.phase} - {self.subphase.upper()}"
@@ -198,15 +201,11 @@ class AutonomousYoloFollower(Node):
         # PHASE 0 : QGC Takeoff
         # -----------------------------------------------------------------
         if self.phase == 0:
-            # self.print(f"현재 [Phase 0] 대기 중... PX4 nav_state: {self.nav_state}")
             if self.nav_state in [3, 5, 17]:
-                self.print(f"이륙 완료... PX4 nav_state: {self.nav_state}")
-
+                self.print(f"Takeoff Complete... PX4 nav_state: {self.nav_state}")
                 self.phase = 1
                 self.subphase = 'survey mission'
-
                 self.print('\n[Phase 0 -> 1] Takeoff detected. Moving to PX4 Mission Modes.\n')
-                # self.print(f"미션 모드... PX4 nav_state: {self.nav_state}")
 
         # -----------------------------------------------------------------
         # PHASE 1 : YOLO Detection during Mission Mode
@@ -269,10 +268,9 @@ class AutonomousYoloFollower(Node):
                         self.time_count = 0
                         self.yolo_time_count = 0
                         
-                        # Once Target is confirmed, change to Land Mode.
+                        # Once target is confirmed, transition to forward approach phase instead of landing directly
                         self.subphase = 'approaching target'
-                        self.print('[Subphase : Validated] Target confirmed! Triggering AUTO LAND mode.')
-                        self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+                        self.print('[Subphase : Validated] Target confirmed! Approaching target while aligning yaw.')
                     else:
                         self.bird_count = 0
                         self.time_count = 0
@@ -289,12 +287,34 @@ class AutonomousYoloFollower(Node):
                     self.yolo_time_count += 1
 
             elif self.subphase == 'approaching target':
-                # 기체가 LAND 모드로 진입했으므로 속도 제어 루프는 정지하고 안전 호버링 중립 상태를 유지합니다.
+                # Check if the bounding box width ratio has reached or exceeded 50%
+                if self.target_detected and self.current_ratio_percent >= 50.0:
+                    # Halt forward progression, trigger landing command, and shift state
+                    self.publish_velocity_setpoint(0.0, 0.0, 0.0, yaw_rate=0.0)
+                    self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
+                    self.subphase = 'landing'
+                    self.print('\n[Approaching -> Landing] Target is close enough (>= 50%). Triggering AUTO LAND mode.\n')
+                else:
+                    # Real-time computation of target bearing angle
+                    if self.target_detected:
+                        self.goal_yaw = self.get_bearing_to_target()
+                    
+                    # Compute Body-Fixed forward velocity relative to current drone heading (current_yaw)
+                    # Coordinate transform needed as PX4 Offboard Velocity Setpoint operates in NED frame
+                    v_north = self.approach_speed * np.cos(self.current_yaw)
+                    v_east = self.approach_speed * np.sin(self.current_yaw)
+                    v_down = 0.0  # Maintain altitude during horizontal transit
+                    
+                    # Publish velocity setpoint incorporating target heading tracking
+                    self.publish_velocity_setpoint(v_north, v_east, v_down, yaw=self.goal_yaw)
+                    self.print(f"[Approaching] Width: {self.current_ratio_percent:.1f}% / 50.0% | Aligning Yaw to {self.goal_yaw:.2f} rad", end='\r')
+
+            elif self.subphase == 'landing':
                 self.publish_velocity_setpoint(0.0, 0.0, 0.0, yaw_rate=0.0)
                 self.print('[Landing] PX4 Landing sequence initiated. Monitoring altitude...', end='\r')
 
     # -----------------------------------------------------------------
-    # 기동 정밀 제어를 위한 기하학적 연산 헬퍼 서브 메서드 군
+    # Geometric Operation Helper Sub-methods for Precision Maneuvers
     # -----------------------------------------------------------------
     def get_braking_position(self, current_pos, current_vel):
         braking_distance_factor = 0.8 
@@ -311,7 +331,7 @@ class AutonomousYoloFollower(Node):
         return angle
 
     # -----------------------------------------------------------------
-    # PX4 통신 및 전송 로우레벨 인터페이스 메타
+    # PX4 Communication and Transmission Low-level Interface Meta
     # -----------------------------------------------------------------
     def publish_offboard_control_mode(self):
         msg = OffboardControlMode()
