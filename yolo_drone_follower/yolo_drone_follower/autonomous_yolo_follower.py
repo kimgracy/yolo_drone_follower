@@ -33,7 +33,7 @@ class AutonomousYoloFollower(Node):
         self.kp_z = 0.003           
         self.kp_yaw = 0.004         
         
-        self.yolo_hz = 6            # Hz 타임아웃 계산용 기점
+        self.yolo_hz = 3            # Hz 타임아웃 계산용 기점
         self.quick_time = 0.5       # 오프보드 트리거를 위한 지속 검출 시간 (초)
         self.focus_time = 1.5       # 정렬 후 타겟 정밀 정치 검증 시간 (초)
         self.mc_acceptance_radius = 0.3  # 위치 도달 인정 반경 (m)
@@ -42,7 +42,7 @@ class AutonomousYoloFollower(Node):
 
         self.bridge = CvBridge()
         
-        # 기체 상태 변수
+        # Vehicle Status
         self.nav_state = None
         self.arming_state = None    
         self.current_yaw = 0.0      
@@ -53,12 +53,12 @@ class AutonomousYoloFollower(Node):
         self.target_detected = False
         self.obstacle_label = ''
         self.obstacle_x = 0.0
-        self.image_size = (640, 480) # 기본 해상도 초기값
+        self.image_size = (640, 480)
         
         self.sys_id = 1
         self.comp_id = 1
         
-        # 구조 리팩토링 페이즈 설정
+        # Phase Setup
         self.phase = 0
         self.subphase = 'before flight'
         
@@ -82,7 +82,7 @@ class AutonomousYoloFollower(Node):
         )
 
         # logging setup
-        log_dir = os.path.join(os.getcwd(), 'src/logs')
+        log_dir = os.path.join(os.getcwd(), 'flight_logs')
         os.makedirs(log_dir, exist_ok=True)
         current_time = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         log_file = os.path.join(log_dir,  f'log_{current_time}.txt')
@@ -151,50 +151,37 @@ class AutonomousYoloFollower(Node):
                     
                     ratio_percent = (bbox_width / img_width) * 100.0
                     
-                    # [시각화] 바운딩 박스 그리기
+                    # Bouning Box Visualization
                     cv2.rectangle(cv_image, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 255, 0), 2)
                     confidence = float(box.conf[0])
                     label_text = f"{self.target_class_name} {confidence:.2f} ({ratio_percent:.1f}%)"
                     cv2.putText(cv_image, label_text, (int(xmin), max(int(ymin) - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                     
-                    # 최종 접근 단계 서브페이즈 실시간 반응 속도 연산
+                    # Landing Mode
                     if self.phase == 2 and self.subphase == 'approaching target':
-                        self.cmd_yaw_rate = float((img_center_x - bbox_center_x) * self.kp_yaw)
-                        self.cmd_yaw_rate = np.clip(self.cmd_yaw_rate, -0.2, 0.2)
-                        
-                        stop_threshold_width = img_width * 0.5
-                        
-                        if bbox_width >= stop_threshold_width:
-                            self.cmd_vx = 0.0
-                            z_error = -0.5 - self.current_z
-                            self.cmd_vz = float(z_error * 0.5)
-                        else:
-                            error_width = stop_threshold_width - bbox_width
-                            self.cmd_vx = float(error_width * self.kp_x)
-                            self.cmd_vx = min(self.cmd_vx, 0.4)
-                            self.cmd_vz = float(-(img_center_y - bbox_center_y) * self.kp_z)
-
-                        self.cmd_vz = np.clip(self.cmd_vz, -0.2, 0.2)
+                        self.cmd_yaw_rate = 0.0
+                        self.cmd_vx = 0.0
+                        self.cmd_vz = 0.0
                     break
             if current_target_found: 
                 break
 
         self.target_detected = current_target_found
         
-        # HUD 디스플레이 텍스트 렌더링
+        # Display Texts
         status_text = f"PHASE {self.phase} - {self.subphase.upper()}"
         cv2.putText(cv_image, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
         display_alt = -self.current_z
-        alt_text = f"Current Altitude: {display_alt:.2f}m (Target: 0.50m)"
+        alt_text = f"Current Altitude: {display_alt:.2f}m"
         cv2.putText(cv_image, alt_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         if self.target_detected:
             cv2.putText(cv_image, "TARGET LOCK", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            ratio_text = f"BB Width Ratio: {ratio_percent:.1f}% / 50.0%"
+            ratio_text = f"BB Width Ratio: {ratio_percent:.1f}%"
             cv2.putText(cv_image, ratio_text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         else:
-            cv2.putText(cv_image, "BB Width Ratio: 0.0% / 50.0%", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+            cv2.putText(cv_image, "BB Width Ratio: 0.0%", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
 
         cv2.imshow("YOLO Autonomous Tracker", cv_image)
         cv2.waitKey(1)
@@ -204,54 +191,50 @@ class AutonomousYoloFollower(Node):
         if self.nav_state is None:
             return
 
-        # 백그라운드 오프보드 제어 하트비트 주입은 계속 유지
+        # Background Offboard Heartbeat
         self.publish_offboard_control_mode()
 
         # -----------------------------------------------------------------
-        # PHASE 0 : QGC 이륙 명령 감지
+        # PHASE 0 : QGC Takeoff
         # -----------------------------------------------------------------
         if self.phase == 0:
             # self.print(f"현재 [Phase 0] 대기 중... PX4 nav_state: {self.nav_state}")
             if self.nav_state in [3, 5, 17]:
+                self.print(f"이륙 완료... PX4 nav_state: {self.nav_state}")
+
                 self.phase = 1
-                self.subphase = 'monitoring mission'
+                self.subphase = 'survey mission'
+
                 self.print('\n[Phase 0 -> 1] Takeoff detected. Moving to PX4 Mission Modes.\n')
+                # self.print(f"미션 모드... PX4 nav_state: {self.nav_state}")
 
         # -----------------------------------------------------------------
-        # PHASE 1 : PX4 미션 모드 수행 중 백그라운드 YOLO 감시 및 가로채기
+        # PHASE 1 : YOLO Detection during Mission Mode
         # -----------------------------------------------------------------
         elif self.phase == 1:
-            # 백그라운드 상에서 타겟 누적 카운팅 진행
             if self.obstacle_label == 'dead-bird':
                 self.obstacle_label = ''
                 self.bird_count += 1
                 
-                # 지정된 시간(quick_time)만큼 확실히 검출이 지속된다면 오프보드로 가로채기 수행
                 if self.bird_count >= self.yolo_hz * self.focus_time:
                     self.print('Target Detected\n')
                     self.bird_count = 0
-                    # 가로채는 순간의 속도를 기반으로 안전 제동 목적지 계산
                     self.goal_position = self.get_braking_position(self.pos, self.vel)
                     
-                    # 드론 모드를 OFFBOARD 모드로 강제 변환 명령 송신
                     self.request_offboard_mode()
                     
                     self.phase = 2
                     self.subphase = 'pause'
                     self.print('\n[Phase 1 -> 2] Transitioning to Offboard Flight Mode.\n')
             else:
-                # 노이즈 유실 방지용 소폭 감산 처리 (카운트 상한 제어)
                 self.bird_count = max(0, self.bird_count - 1)
 
         # -----------------------------------------------------------------
-        # PHASE 2 : 오프보드 기반 가로채기 후 정밀 제어 추적
+        # PHASE 2 : YOLO following after Offboard Transition
         # -----------------------------------------------------------------
         elif self.phase == 2:
-            # 안전장치: PX4가 가로채기 명령을 거부하고 수동/기타 모드로 빠지면 복귀하기 위한 예외 확인용
-            # (정상적인 상황에선 하트비트가 가산되므로 무리 없이 오프보드를 유지합니다)
             
             if self.subphase == 'pause':
-                # 가로챈 순간의 관성을 없애기 위해 안전 제동 포인트 홀딩
                 self.publish_trajectory_setpoint(position_sp=self.goal_position)
                 if np.linalg.norm(self.pos - self.goal_position) < self.mc_acceptance_radius:
                     self.goal_yaw = self.get_bearing_to_target()
@@ -262,7 +245,6 @@ class AutonomousYoloFollower(Node):
             elif self.subphase == 'align':
                 self.publish_trajectory_setpoint(position_sp=self.goal_position, yaw_sp=self.goal_yaw)
                 
-                # 기수 각도 오차가 수렴했을 때
                 if np.abs((self.current_yaw - self.goal_yaw + np.pi) % (2 * np.pi) - np.pi) < self.heading_acceptance_angle:
                     self.bird_count = 0
                     self.time_count = 0
@@ -273,7 +255,6 @@ class AutonomousYoloFollower(Node):
                     self.emergency_time_checker += 1
                     if self.emergency_time_checker >= self.align_emergency_threshold:
                         self.emergency_time_checker = 0
-                        # 유실 시 미션 복귀 또는 원호 탐색 유도 (여기서는 원호 원점 백업 분기 처리)
                         self.subphase = 'pause' 
                         self.print('[Warning] Alignment timeout. Re-stabilizing.')
 
@@ -287,16 +268,17 @@ class AutonomousYoloFollower(Node):
                         self.bird_count = 0
                         self.time_count = 0
                         self.yolo_time_count = 0
+                        
+                        # Once Target is confirmed, change to Land Mode.
                         self.subphase = 'approaching target'
-                        self.print('[Subphase : Validated] Moving closer to target based on BB proportion.')
+                        self.print('[Subphase : Validated] Target confirmed! Triggering AUTO LAND mode.')
+                        self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
                     else:
-                        # 허상 검출로 밝혀진 경우 다시 미션 비행(PHASE 1)으로 주도권을 넘김
                         self.bird_count = 0
                         self.time_count = 0
                         self.yolo_time_count = 0
                         self.phase = 1
                         self.subphase = 'monitoring mission'
-                        # PX4에게 다시 AUTO_MISSION 모드로 돌아가라고 명령 송신
                         self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=4.0)
                         self.print('[Validated Failed] False alarm. Handing over control back to PX4 AUTO_MISSION.')
                 else:
@@ -307,22 +289,9 @@ class AutonomousYoloFollower(Node):
                     self.yolo_time_count += 1
 
             elif self.subphase == 'approaching target':
-                if self.target_detected:
-                    cos_yaw = np.cos(self.current_yaw)
-                    sin_yaw = np.sin(self.current_yaw)
-                    vel_north = self.cmd_vx * cos_yaw
-                    vel_east = self.cmd_vx * sin_yaw
-                    
-                    self.publish_velocity_setpoint(vel_north, vel_east, self.cmd_vz, yaw_rate=self.cmd_yaw_rate)
-                    
-                    # 도달 조건 만족 시 무한 홀딩 상태 로그 피드백
-                    if self.cmd_vx == 0.0 and abs(-0.5 - self.current_z) < 0.1:
-                        self.print('[Holding] Target 50% reached & Altitude 0.5m stabilized. Active holding...', end='\r')
-                else:
-                    # 일시 실시간 타겟 유실 시 고도 0.5m 유지 호버링 백업 제어
-                    z_error = -0.5 - self.current_z
-                    backup_vz = np.clip(float(z_error * 0.5), -0.2, 0.2)
-                    self.publish_velocity_setpoint(0.0, 0.0, backup_vz, yaw_rate=0.0)
+                # 기체가 LAND 모드로 진입했으므로 속도 제어 루프는 정지하고 안전 호버링 중립 상태를 유지합니다.
+                self.publish_velocity_setpoint(0.0, 0.0, 0.0, yaw_rate=0.0)
+                self.print('[Landing] PX4 Landing sequence initiated. Monitoring altitude...', end='\r')
 
     # -----------------------------------------------------------------
     # 기동 정밀 제어를 위한 기하학적 연산 헬퍼 서브 메서드 군
@@ -375,7 +344,6 @@ class AutonomousYoloFollower(Node):
         self.publish_velocity_setpoint(0.0, 0.0, 0.0, yaw=float('nan'), yaw_rate=float('nan'))
 
     def request_offboard_mode(self):
-        # Base Mode: 1.0, Custom Offboard Sub Mode: 6.0
         self.send_vehicle_command(VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
 
     def send_vehicle_command(self, command, param1=0.0, param2=0.0, param7=0.0):
